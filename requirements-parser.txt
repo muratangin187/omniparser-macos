@@ -1,0 +1,17 @@
+torch
+torchvision
+easyocr
+supervision==0.18.0
+openai==1.3.5
+transformers==4.49.0
+ultralytics==8.3.70
+numpy==1.26.4
+opencv-python-headless
+gradio
+dill
+accelerate
+timm
+einops==0.8.0
+matplotlib
+requests
+huggingface_hub[cli]

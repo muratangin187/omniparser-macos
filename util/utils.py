@@ -17,18 +17,6 @@ import cv2
 import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
-import easyocr
-from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
 import time
 import base64
 
@@ -41,7 +29,37 @@ import re
 from torchvision.transforms import ToPILImage
 import supervision as sv
 import torchvision.transforms as T
-from util.box_annotator import BoxAnnotator 
+from util.box_annotator import BoxAnnotator
+
+reader = None
+paddle_ocr = None
+
+
+def get_easyocr_reader():
+    global reader
+    if reader is None:
+        import easyocr
+
+        reader = easyocr.Reader(['en'])
+    return reader
+
+
+def get_paddle_ocr():
+    global paddle_ocr
+    if paddle_ocr is None:
+        from paddleocr import PaddleOCR
+
+        paddle_ocr = PaddleOCR(
+            lang='en',
+            use_angle_cls=False,
+            use_gpu=False,
+            show_log=False,
+            max_batch_size=1024,
+            use_dilation=True,
+            det_db_score_mode='slow',
+            rec_batch_num=1024,
+        )
+    return paddle_ocr
 
 
 def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None):
@@ -62,7 +80,12 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
         from transformers import AutoProcessor, AutoModelForCausalLM 
         processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
         if device == 'cpu':
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                attn_implementation="eager",
+            )
         else:
             model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
     return {'model': model.to(device), 'processor': processor}
@@ -107,12 +130,19 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
         start = time.time()
         batch = croped_pil_image[i:i+batch_size]
         t1 = time.time()
-        if model.device.type == 'cuda':
-            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt", do_resize=False).to(device=device, dtype=torch.float16)
-        else:
-            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(device=device)
+        inputs = processor(images=batch, text=[prompt] * len(batch), return_tensors="pt", do_resize=False).to(device=device)
+        if model.device.type in {"cuda", "mps"} and "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(device=device, dtype=model.dtype)
         if 'florence' in model.config.name_or_path:
-            generated_ids = model.generate(input_ids=inputs["input_ids"],pixel_values=inputs["pixel_values"],max_new_tokens=20,num_beams=1, do_sample=False)
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=20,
+                num_beams=1,
+                do_sample=False,
+                early_stopping=False,
+                use_cache=False,
+            )
         else:
             generated_ids = model.generate(**inputs, max_length=100, num_beams=5, no_repeat_ngram_size=2, early_stopping=True, num_return_sequences=1) # temperature=0.01, do_sample=True,
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
@@ -418,7 +448,14 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     if not imgsz:
         imgsz = (h, w)
     # print('image size:', w, h)
-    xyxy, logits, phrases = predict_yolo(model=model, image=image_source, box_threshold=BOX_TRESHOLD, imgsz=imgsz, scale_img=scale_img, iou_threshold=0.1)
+    xyxy, logits, phrases = predict_yolo(
+        model=model,
+        image=image_source,
+        box_threshold=BOX_TRESHOLD,
+        imgsz=imgsz,
+        scale_img=scale_img,
+        iou_threshold=iou_threshold,
+    )
     xyxy = xyxy / torch.Tensor([w, h, w, h]).to(xyxy.device)
     image_source = np.asarray(image_source)
     phrases = [str(i) for i in range(len(phrases))]
@@ -431,7 +468,13 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         print('no ocr bbox!!!')
         ocr_bbox = None
 
-    ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
+    ocr_bbox_elem = []
+    if ocr_bbox:
+        ocr_bbox_elem = [
+            {'type': 'text', 'bbox': box, 'interactivity': False, 'content': txt, 'source': 'box_ocr_content_ocr'}
+            for box, txt in zip(ocr_bbox, ocr_text)
+            if int_box_area(box, w, h) > 0
+        ]
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
     filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
     
@@ -514,13 +557,13 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
+        result = get_paddle_ocr().ocr(image_np, cls=False)[0]
         coord = [item[0] for item in result if item[1][1] > text_threshold]
         text = [item[1][0] for item in result if item[1][1] > text_threshold]
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
-        result = reader.readtext(image_np, **easyocr_args)
+        result = get_easyocr_reader().readtext(image_np, **easyocr_args)
         coord = [item[0] for item in result]
         text = [item[1] for item in result]
     if display_img:
