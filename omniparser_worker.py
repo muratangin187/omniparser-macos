@@ -13,7 +13,19 @@ def parse_args():
     parser.add_argument("--weights-dir", default="weights")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--som-device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--preset", default="balanced", choices=["full", "balanced", "turbo", "ultra"])
+    parser.add_argument("--preset", default="balanced", choices=["full", "balanced", "recall", "turbo", "ultra"])
+    parser.add_argument("--box-threshold", type=float, default=None)
+    parser.add_argument("--iou-threshold", type=float, default=None)
+    parser.add_argument("--imgsz", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--ocr-batch-size", type=int, default=None)
+    parser.add_argument("--ocr-canvas-size", type=int, default=None)
+    parser.add_argument("--icon-crop-size", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--use-paddleocr", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--no-ocr", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--no-semantics", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--scale-img", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--png-compress-level", type=int, default=1)
     parser.add_argument("--output-format", default="png", choices=sorted(OUTPUT_FORMATS))
     parser.add_argument("--no-warmup", action="store_true")
@@ -41,6 +53,23 @@ def build_parser_config(args):
         max_new_tokens=20,
     )
     apply_preset(namespace)
+    for field in [
+        "box_threshold",
+        "iou_threshold",
+        "imgsz",
+        "batch_size",
+        "ocr_batch_size",
+        "ocr_canvas_size",
+        "use_paddleocr",
+        "no_ocr",
+        "no_semantics",
+        "scale_img",
+        "icon_crop_size",
+        "max_new_tokens",
+    ]:
+        value = getattr(args, field, None)
+        if value is not None:
+            setattr(namespace, field, value)
     return {
         "weights_dir": args.weights_dir,
         "device": namespace.device,

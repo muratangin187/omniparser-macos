@@ -7,7 +7,7 @@ Mac-focused OmniParser setup with:
 - a local HTTP server for app integrations
 - a local Gradio app
 - Apple Silicon `mps` support
-- subsecond `balanced`, `turbo`, and `ultra` presets
+- subsecond `balanced`, `recall`, `turbo`, and `ultra` presets
 - Swift-friendly JSON and annotated image outputs
 
 This repository is based on [microsoft/OmniParser](https://github.com/microsoft/OmniParser) and keeps the original project files, while adding the pieces needed to run it reliably on a modern Mac.
@@ -22,7 +22,7 @@ Compared with upstream, this repo adds and fixes:
 - a reusable parser wrapper in `util/omniparser.py`
 - lazy OCR backend loading so startup is more reliable on macOS
 - `mps` support for the Florence caption model path
-- tuned `balanced`, `turbo`, and `ultra` presets for Apple Silicon
+- tuned `balanced`, `recall`, `turbo`, and `ultra` presets for Apple Silicon
 - caption caching for repeated screenshots in a hot process
 - worker warm-up so the first real screenshot is faster
 - direct image saving for CLI and worker outputs without a base64 round-trip
@@ -100,7 +100,7 @@ Useful flags:
 
 - `--device auto|cpu|mps|cuda`
 - `--som-device auto|cpu|mps|cuda`
-- `--preset full|balanced|turbo|ultra`
+- `--preset full|balanced|recall|turbo|ultra`
 - `--no-ocr`
 - `--no-semantics`
 - `--scale-img`
@@ -140,6 +140,20 @@ Useful flags:
 --max-new-tokens 3
 ```
 
+`recall` is the higher-coverage semantic preset for denser screens and smaller controls:
+
+```text
+--device mps
+--som-device cpu
+--no-ocr
+--scale-img
+--box-threshold 0.10
+--imgsz 512
+--batch-size 192
+--icon-crop-size 32
+--max-new-tokens 3
+```
+
 `ultra` is the box-only preset:
 
 ```text
@@ -158,11 +172,14 @@ Measured on the validation image used during setup on an Apple M4 Pro, using `/U
 - older cold CPU path: about `18.85s`
 - older cold MPS path: about `23.62s`
 - current cold CLI `balanced` wall time: about `5.38s`
+- current cold CLI `recall` wall time: about `7.27s`
 - current cold CLI `turbo` wall time: about `5.29s`
 - current hot-worker first `balanced` request wall time with JPEG output: about `507ms`
+- current hot-worker first `recall` request wall time with JPEG output: about `686ms`
 - current hot-worker first `turbo` request wall time with JPEG output: about `412ms`
 - current hot-worker first `ultra` request wall time with JPEG output: about `188ms`
 - current repeated cached `balanced` request wall time with JPEG output: about `117ms`
+- current repeated cached `recall` request wall time with JPEG output: about `165ms`
 - current repeated cached `turbo` request wall time with JPEG output: about `117ms`
 
 Those numbers will vary by screenshot size and GUI density, but the tuned hot-process path is now well under `1s` for semantic parsing and well under `250ms` for box-only parsing.
@@ -238,6 +255,8 @@ Example response:
 }
 ```
 
+The server also accepts per-request tuning overrides, so you can keep `--preset turbo` as the default and ask for higher recall only on the screenshots that need it.
+
 ### Upload Endpoint
 
 Send an image file directly:
@@ -276,6 +295,19 @@ Example response shape:
   "annotated_image_mime_type": "image/jpeg",
   "annotated_image_base64": "/9j/4AAQSk..."
 }
+```
+
+Higher-recall example for smaller controls:
+
+```bash
+curl -X POST http://127.0.0.1:7862/parse-path \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/Users/you/Desktop/test.png",
+    "box_threshold": 0.10,
+    "imgsz": 512,
+    "include_annotated_image": false
+  }'
 ```
 
 ### File Path Endpoint
@@ -387,7 +419,7 @@ Recommended production path for Swift:
 3. send one JSON request per screenshot
 4. reuse the in-memory model and caption cache
 
-That is the path that gets semantic responses to roughly `400-500ms` on the first request and roughly `100-120ms` on repeated identical screenshots.
+That is the path that gets semantic responses to roughly `400-500ms` on the first request in `turbo`, roughly `650-700ms` in `recall`, and roughly `100-165ms` on repeated identical screenshots after caption-cache hits.
 
 ### Swift With The Server
 
@@ -462,7 +494,7 @@ func uploadScreenshot(_ imageData: Data) async throws -> OmniParserServerRespons
 }
 ```
 
-If you prefer file paths instead of a large base64 response, call `POST /parse-path` with a temp screenshot path and an `output_dir`.
+If you prefer file paths instead of a large base64 response, call `POST /parse-path` with a temp screenshot path and an `output_dir`. You can also override `box_threshold`, `imgsz`, `batch_size`, `icon_crop_size`, `max_new_tokens`, `enable_ocr`, `use_local_semantics`, and `scale_img` per request.
 
 ## Repository Layout
 

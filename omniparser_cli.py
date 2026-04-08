@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument("--weights-dir", default="weights")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--som-device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--preset", default="full", choices=["full", "balanced", "turbo", "ultra"])
+    parser.add_argument("--preset", default="full", choices=["full", "balanced", "recall", "turbo", "ultra"])
     parser.add_argument("--box-threshold", type=float, default=0.05)
     parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -51,6 +51,18 @@ def apply_preset(args):
         args.scale_img = True
         args.box_threshold = 0.18
         args.imgsz = 384
+        args.batch_size = 192
+        args.icon_crop_size = 32
+        args.max_new_tokens = 3
+    elif args.preset == "recall":
+        if args.device == "auto":
+            args.device = "mps"
+        if args.som_device == "auto":
+            args.som_device = "cpu"
+        args.no_ocr = True
+        args.scale_img = True
+        args.box_threshold = 0.10
+        args.imgsz = 512
         args.batch_size = 192
         args.icon_crop_size = 32
         args.max_new_tokens = 3

@@ -22,7 +22,19 @@ def parse_args():
     parser.add_argument("--weights-dir", default="weights")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--som-device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--preset", default="turbo", choices=["full", "balanced", "turbo", "ultra"])
+    parser.add_argument("--preset", default="turbo", choices=["full", "balanced", "recall", "turbo", "ultra"])
+    parser.add_argument("--box-threshold", type=float, default=None)
+    parser.add_argument("--iou-threshold", type=float, default=None)
+    parser.add_argument("--imgsz", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--ocr-batch-size", type=int, default=None)
+    parser.add_argument("--ocr-canvas-size", type=int, default=None)
+    parser.add_argument("--icon-crop-size", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--use-paddleocr", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--no-ocr", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--no-semantics", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--scale-img", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--png-compress-level", type=int, default=1)
     parser.add_argument("--output-format", default="jpg", choices=sorted(OUTPUT_FORMATS))
     parser.add_argument("--host", default="127.0.0.1")
@@ -37,6 +49,15 @@ class ParsePathRequest(BaseModel):
     output_dir: Optional[str] = None
     output_format: Optional[str] = Field(default=None, pattern="^(png|jpg|bmp)$")
     include_annotated_image: bool = False
+    enable_ocr: Optional[bool] = None
+    use_local_semantics: Optional[bool] = None
+    scale_img: Optional[bool] = None
+    box_threshold: Optional[float] = None
+    iou_threshold: Optional[float] = None
+    imgsz: Optional[int] = None
+    batch_size: Optional[int] = None
+    icon_crop_size: Optional[int] = None
+    max_new_tokens: Optional[int] = None
 
 
 def get_save_kwargs(output_format: str, png_compress_level: int):
@@ -119,6 +140,39 @@ def build_response(result, image_name: str, output_dir: Optional[str], output_fo
     return response
 
 
+def parse_kwargs_from_request(
+    enable_ocr=None,
+    use_local_semantics=None,
+    scale_img=None,
+    box_threshold=None,
+    iou_threshold=None,
+    imgsz=None,
+    batch_size=None,
+    icon_crop_size=None,
+    max_new_tokens=None,
+):
+    kwargs = {}
+    if enable_ocr is not None:
+        kwargs["enable_ocr"] = enable_ocr
+    if use_local_semantics is not None:
+        kwargs["use_local_semantics"] = use_local_semantics
+    if scale_img is not None:
+        kwargs["scale_img"] = scale_img
+    if box_threshold is not None:
+        kwargs["box_threshold"] = box_threshold
+    if iou_threshold is not None:
+        kwargs["iou_threshold"] = iou_threshold
+    if imgsz is not None:
+        kwargs["imgsz"] = imgsz
+    if batch_size is not None:
+        kwargs["batch_size"] = batch_size
+    if icon_crop_size is not None:
+        kwargs["icon_crop_size"] = icon_crop_size
+    if max_new_tokens is not None:
+        kwargs["max_new_tokens"] = max_new_tokens
+    return kwargs
+
+
 def create_app(args):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -139,6 +193,9 @@ def create_app(args):
             "preset": args.preset,
             "device": args.device,
             "som_device": args.som_device,
+            "box_threshold": app.state.parser.config["BOX_TRESHOLD"],
+            "imgsz": app.state.parser.config["imgsz"],
+            "scale_img": app.state.parser.config["scale_img"],
             "default_output_format": args.output_format,
             "endpoints": ["/healthz", "/parse", "/parse-path"],
         }
@@ -153,9 +210,20 @@ def create_app(args):
         if not image_path.exists():
             raise HTTPException(status_code=404, detail=f"Image not found: {image_path}")
         output_format = request.output_format or args.output_format
+        parse_kwargs = parse_kwargs_from_request(
+            enable_ocr=request.enable_ocr,
+            use_local_semantics=request.use_local_semantics,
+            scale_img=request.scale_img,
+            box_threshold=request.box_threshold,
+            iou_threshold=request.iou_threshold,
+            imgsz=request.imgsz,
+            batch_size=request.batch_size,
+            icon_crop_size=request.icon_crop_size,
+            max_new_tokens=request.max_new_tokens,
+        )
 
         with app.state.lock:
-            result = app.state.parser.parse_image(image_path, encode_output=False)
+            result = app.state.parser.parse_image(image_path, encode_output=False, **parse_kwargs)
 
         return build_response(
             result,
@@ -172,14 +240,34 @@ def create_app(args):
         output_dir: Optional[str] = Form(default=None),
         output_format: str = Form(default=args.output_format),
         include_annotated_image: bool = Form(default=True),
+        enable_ocr: Optional[bool] = Form(default=None),
+        use_local_semantics: Optional[bool] = Form(default=None),
+        scale_img: Optional[bool] = Form(default=None),
+        box_threshold: Optional[float] = Form(default=None),
+        iou_threshold: Optional[float] = Form(default=None),
+        imgsz: Optional[int] = Form(default=None),
+        batch_size: Optional[int] = Form(default=None),
+        icon_crop_size: Optional[int] = Form(default=None),
+        max_new_tokens: Optional[int] = Form(default=None),
     ):
         if output_format not in OUTPUT_FORMATS:
             raise HTTPException(status_code=400, detail=f"Unsupported output format: {output_format}")
         try:
             image_bytes = image.file.read()
             parsed_image = Image.open(io.BytesIO(image_bytes))
+            parse_kwargs = parse_kwargs_from_request(
+                enable_ocr=enable_ocr,
+                use_local_semantics=use_local_semantics,
+                scale_img=scale_img,
+                box_threshold=box_threshold,
+                iou_threshold=iou_threshold,
+                imgsz=imgsz,
+                batch_size=batch_size,
+                icon_crop_size=icon_crop_size,
+                max_new_tokens=max_new_tokens,
+            )
             with app.state.lock:
-                result = app.state.parser.parse_image(parsed_image, encode_output=False)
+                result = app.state.parser.parse_image(parsed_image, encode_output=False, **parse_kwargs)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to parse uploaded image: {exc}") from exc
 
