@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     "use_local_semantics": True,
     "scale_img": False,
     "som_device": "auto",
+    "png_compress_level": 1,
     "verbose": False,
 }
 
@@ -81,6 +82,7 @@ class Omniparser(object):
         batch_size: Optional[int] = None,
         icon_crop_size: Optional[int] = None,
         max_new_tokens: Optional[int] = None,
+        encode_output: bool = True,
     ) -> Dict[str, Any]:
         if isinstance(image_source, (str, Path)):
             image = Image.open(image_source)
@@ -156,13 +158,49 @@ class Omniparser(object):
             device=self.config["som_device"],
         )
         stats["total_ms"] = round((time.time() - total_started) * 1000, 2)
-
-        return {
-            "annotated_image_base64": dino_labeled_img,
+        response = {
             "label_coordinates": label_coordinates,
             "parsed_content_list": parsed_content_list,
             "stats": stats,
         }
+        if encode_output:
+            encoded_started = time.time()
+            buffered = io.BytesIO()
+            dino_labeled_img.save(
+                buffered,
+                format="PNG",
+                compress_level=self.config["png_compress_level"],
+            )
+            response["annotated_image_base64"] = base64.b64encode(buffered.getvalue()).decode("ascii")
+            response["stats"]["encode_ms"] = round((time.time() - encoded_started) * 1000, 2)
+        else:
+            response["annotated_image"] = dino_labeled_img
+            response["stats"]["encode_ms"] = 0.0
+        return response
+
+    @torch.inference_mode()
+    def warmup(self) -> None:
+        if not self.config["use_local_semantics"]:
+            return
+
+        icon_size = self.config["icon_crop_size"]
+        prompt = "<CAPTION>" if self.config["caption_model_name"] == "florence2" else "The image shows"
+        images = [Image.new("RGB", (icon_size, icon_size), "white") for _ in range(4)]
+        model = self.caption_model_processor["model"]
+        processor = self.caption_model_processor["processor"]
+        inputs = processor(images=images, text=[prompt] * len(images), return_tensors="pt", do_resize=False).to(device=model.device)
+        if model.device.type in {"cuda", "mps"} and "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(device=model.device, dtype=model.dtype)
+        model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=max(3, min(self.config["max_new_tokens"], 4)),
+            num_beams=1,
+            do_sample=False,
+            early_stopping=False,
+            use_cache=False,
+        )
+        self.caption_cache.clear()
 
     def parse(self, image_base64: str):
         image_bytes = base64.b64decode(image_base64)

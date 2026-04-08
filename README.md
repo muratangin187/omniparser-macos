@@ -6,8 +6,8 @@ Mac-focused OmniParser setup with:
 - a persistent stdio worker for hot requests
 - a local Gradio app
 - Apple Silicon `mps` support
-- subsecond balanced and ultra-fast presets
-- Swift-friendly JSON and annotated PNG outputs
+- subsecond `balanced`, `turbo`, and `ultra` presets
+- Swift-friendly JSON and annotated image outputs
 
 This repository is based on [microsoft/OmniParser](https://github.com/microsoft/OmniParser) and keeps the original project files, while adding the pieces needed to run it reliably on a modern Mac.
 
@@ -20,8 +20,11 @@ Compared with upstream, this repo adds and fixes:
 - a reusable parser wrapper in `util/omniparser.py`
 - lazy OCR backend loading so startup is more reliable on macOS
 - `mps` support for the Florence caption model path
-- tuned `balanced` and `ultra` presets for Apple Silicon
+- tuned `balanced`, `turbo`, and `ultra` presets for Apple Silicon
 - caption caching for repeated screenshots in a hot process
+- worker warm-up so the first real screenshot is faster
+- direct image saving for CLI and worker outputs without a base64 round-trip
+- optional JPEG or BMP output for lower save latency
 - a Gradio launcher that does not assume CUDA or `share=True`
 - a smaller parser-only dependency file: `requirements-parser.txt`
 
@@ -79,7 +82,7 @@ Run the parser on a single screenshot:
 
 Generated files:
 
-- `outputs/<name>_annotated.png`
+- `outputs/<name>_annotated.<png|jpg|bmp>`
 - `outputs/<name>_parsed.json`
 
 Example:
@@ -95,12 +98,13 @@ Useful flags:
 
 - `--device auto|cpu|mps|cuda`
 - `--som-device auto|cpu|mps|cuda`
-- `--preset full|balanced|ultra`
+- `--preset full|balanced|turbo|ultra`
 - `--no-ocr`
 - `--no-semantics`
 - `--scale-img`
-- `--icon-crop-size 48`
-- `--max-new-tokens 6`
+- `--icon-crop-size 32`
+- `--max-new-tokens 3`
+- `--output-format png|jpg|bmp`
 - `--use-paddleocr`
 - `--fast`
 
@@ -113,11 +117,25 @@ Useful flags:
 --som-device cpu
 --no-ocr
 --scale-img
+--box-threshold 0.18
+--imgsz 384
+--batch-size 192
+--icon-crop-size 32
+--max-new-tokens 3
+```
+
+`turbo` is the more aggressive semantic preset:
+
+```text
+--device mps
+--som-device cpu
+--no-ocr
+--scale-img
 --box-threshold 0.15
---imgsz 512
---batch-size 128
---icon-crop-size 48
---max-new-tokens 6
+--imgsz 320
+--batch-size 192
+--icon-crop-size 32
+--max-new-tokens 3
 ```
 
 `ultra` is the box-only preset:
@@ -128,28 +146,31 @@ Useful flags:
 --no-ocr
 --no-semantics
 --scale-img
---box-threshold 0.20
+--box-threshold 0.18
 --imgsz 384
+--batch-size 192
 ```
 
-Measured on the validation image used during setup on an Apple M4 Pro:
+Measured on the validation image used during setup on an Apple M4 Pro, using `/Users/muratangin/madlen/misc/test.png`:
 
 - older cold CPU path: about `18.85s`
 - older cold MPS path: about `23.62s`
-- current cold CLI `balanced` wall time: about `5.79s`
-- current semantic parse time in `balanced`: about `954ms`
-- current hot-worker first `balanced` request wall time: about `1.03s`
-- current repeated cached `balanced` request wall time: about `295ms`
-- current hot-worker `ultra` request wall time: about `349ms`
+- current cold CLI `balanced` wall time: about `5.38s`
+- current cold CLI `turbo` wall time: about `5.29s`
+- current hot-worker first `balanced` request wall time with JPEG output: about `507ms`
+- current hot-worker first `turbo` request wall time with JPEG output: about `412ms`
+- current hot-worker first `ultra` request wall time with JPEG output: about `188ms`
+- current repeated cached `balanced` request wall time with JPEG output: about `117ms`
+- current repeated cached `turbo` request wall time with JPEG output: about `117ms`
 
-Those numbers will vary by screenshot size and GUI density, but the tuned hot-process path is materially faster than the original Mac run path.
+Those numbers will vary by screenshot size and GUI density, but the tuned hot-process path is now well under `1s` for semantic parsing and well under `250ms` for box-only parsing.
 
 ## Persistent Worker
 
 For a real app, do not spawn the CLI for every screenshot. Start the worker once and keep it alive:
 
 ```bash
-.venv/bin/python omniparser_worker.py --preset balanced
+.venv/bin/python omniparser_worker.py --preset balanced --output-format jpg
 ```
 
 The worker speaks JSON over stdin/stdout.
@@ -166,15 +187,16 @@ Response:
 {
   "ok": true,
   "stats": {
-    "total_ms": 935.88,
-    "detect_ms": 141.5,
-    "caption_ms": 663.73,
+    "total_ms": 492.75,
+    "detect_ms": 135.5,
+    "caption_ms": 305.14,
     "caption_cache_hits": 0,
-    "caption_cache_misses": 78
+    "caption_cache_misses": 51,
+    "save_ms": 12.31
   },
-  "output_image": "/tmp/omni-out/test_annotated.png",
+  "output_image": "/tmp/omni-out/test_annotated.jpg",
   "output_json": "/tmp/omni-out/test_parsed.json",
-  "items": 78
+  "items": 51
 }
 ```
 
@@ -191,9 +213,9 @@ Start the local UI:
 ```bash
 .venv/bin/python gradio_demo.py \
   --device mps \
-  --default-box-threshold 0.15 \
-  --default-imgsz 512 \
-  --batch-size 128 \
+  --default-box-threshold 0.18 \
+  --default-imgsz 384 \
+  --batch-size 192 \
   --ocr-batch-size 16 \
   --ocr-canvas-size 1920
 ```
@@ -248,7 +270,8 @@ Typical command:
 /absolute/path/to/.venv/bin/python \
 /absolute/path/to/omniparser_cli.py \
 --image /absolute/path/to/screenshot.png \
---preset balanced \
+--preset turbo \
+--output-format jpg \
 --output-dir /absolute/path/to/output-dir
 ```
 
@@ -259,7 +282,7 @@ Recommended production path for Swift:
 3. send one JSON request per screenshot
 4. reuse the in-memory model and caption cache
 
-That is the path that gets semantic responses to roughly `1s` on first request and a few hundred milliseconds on repeated similar screenshots.
+That is the path that gets semantic responses to roughly `400-500ms` on the first request and roughly `100-120ms` on repeated identical screenshots.
 
 ## Repository Layout
 
@@ -278,6 +301,7 @@ Relevant files added or changed for the macOS workflow:
 - `outputs*/` is also gitignored.
 - This repository still includes the upstream Microsoft project files and license.
 - The project is PyTorch-based, so Apple acceleration here uses `mps`, not MLX.
+- I tested an MLX route with `mlx-vlm` and `mlx-community/Florence-2-base-ft-4bit`; on this machine it failed to load Florence cleanly, so MLX is not currently a drop-in replacement for the caption path in this repo.
 
 ## Upstream
 

@@ -1,12 +1,15 @@
 import argparse
-import base64
-import io
 import json
+import time
 from pathlib import Path
 
-from PIL import Image
-
 from util.omniparser import Omniparser
+
+OUTPUT_FORMATS = {
+    "png": ("PNG", ".png"),
+    "jpg": ("JPEG", ".jpg"),
+    "bmp": ("BMP", ".bmp"),
+}
 
 
 def parse_args():
@@ -15,7 +18,7 @@ def parse_args():
     parser.add_argument("--weights-dir", default="weights")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--som-device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--preset", default="full", choices=["full", "balanced", "ultra"])
+    parser.add_argument("--preset", default="full", choices=["full", "balanced", "turbo", "ultra"])
     parser.add_argument("--box-threshold", type=float, default=0.05)
     parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -29,13 +32,15 @@ def parse_args():
     parser.add_argument("--scale-img", action="store_true")
     parser.add_argument("--icon-crop-size", type=int, default=64)
     parser.add_argument("--max-new-tokens", type=int, default=20)
+    parser.add_argument("--png-compress-level", type=int, default=1)
+    parser.add_argument("--output-format", default="png", choices=sorted(OUTPUT_FORMATS))
     parser.add_argument("--output-dir", default="outputs")
     return parser.parse_args()
 
 
 def apply_preset(args):
     if args.fast and args.preset == "full":
-        args.preset = "balanced"
+        args.preset = "turbo"
 
     if args.preset == "balanced":
         if args.device == "auto":
@@ -44,11 +49,23 @@ def apply_preset(args):
             args.som_device = "cpu"
         args.no_ocr = True
         args.scale_img = True
+        args.box_threshold = 0.18
+        args.imgsz = 384
+        args.batch_size = 192
+        args.icon_crop_size = 32
+        args.max_new_tokens = 3
+    elif args.preset == "turbo":
+        if args.device == "auto":
+            args.device = "mps"
+        if args.som_device == "auto":
+            args.som_device = "cpu"
+        args.no_ocr = True
+        args.scale_img = True
         args.box_threshold = 0.15
-        args.imgsz = 512
-        args.batch_size = 128
-        args.icon_crop_size = 48
-        args.max_new_tokens = 6
+        args.imgsz = 320
+        args.batch_size = 192
+        args.icon_crop_size = 32
+        args.max_new_tokens = 3
     elif args.preset == "ultra":
         if args.device == "auto":
             args.device = "mps"
@@ -57,11 +74,11 @@ def apply_preset(args):
         args.no_ocr = True
         args.no_semantics = True
         args.scale_img = True
-        args.box_threshold = 0.20
+        args.box_threshold = 0.18
         args.imgsz = 384
-        args.batch_size = 128
-        args.icon_crop_size = 48
-        args.max_new_tokens = 8
+        args.batch_size = 192
+        args.icon_crop_size = 32
+        args.max_new_tokens = 3
 
 
 def main():
@@ -74,7 +91,8 @@ def main():
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_image_path = output_dir / f"{image_path.stem}_annotated.png"
+    image_format, image_suffix = OUTPUT_FORMATS[args.output_format]
+    output_image_path = output_dir / f"{image_path.stem}_annotated{image_suffix}"
     output_json_path = output_dir / f"{image_path.stem}_parsed.json"
 
     omniparser = Omniparser(
@@ -97,6 +115,7 @@ def main():
             "batch_size": args.batch_size,
             "icon_crop_size": args.icon_crop_size,
             "max_new_tokens": args.max_new_tokens,
+            "png_compress_level": args.png_compress_level,
         }
     )
     result = omniparser.parse_image(
@@ -116,10 +135,17 @@ def main():
         batch_size=args.batch_size,
         icon_crop_size=args.icon_crop_size,
         max_new_tokens=args.max_new_tokens,
+        encode_output=False,
     )
 
-    annotated_image = Image.open(io.BytesIO(base64.b64decode(result["annotated_image_base64"])))
-    annotated_image.save(output_image_path)
+    save_started = time.time()
+    save_kwargs = {"format": image_format}
+    if image_format == "PNG":
+        save_kwargs["compress_level"] = args.png_compress_level
+    elif image_format == "JPEG":
+        save_kwargs["quality"] = 90
+    result["annotated_image"].save(output_image_path, **save_kwargs)
+    result["stats"]["save_ms"] = round((time.time() - save_started) * 1000, 2)
 
     payload = {
         "input_image": str(image_path),
