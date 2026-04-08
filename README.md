@@ -4,6 +4,7 @@ Mac-focused OmniParser setup with:
 
 - a verified single-image CLI
 - a persistent stdio worker for hot requests
+- a local HTTP server for app integrations
 - a local Gradio app
 - Apple Silicon `mps` support
 - subsecond `balanced`, `turbo`, and `ultra` presets
@@ -17,6 +18,7 @@ Compared with upstream, this repo adds and fixes:
 
 - a real CLI entry point: `omniparser_cli.py`
 - a persistent worker process: `omniparser_worker.py`
+- a local FastAPI server: `omniparser_server.py`
 - a reusable parser wrapper in `util/omniparser.py`
 - lazy OCR backend loading so startup is more reliable on macOS
 - `mps` support for the Florence caption model path
@@ -206,6 +208,109 @@ Shutdown:
 {"action":"shutdown"}
 ```
 
+## Local HTTP Server
+
+If you prefer an HTTP interface instead of stdin/stdout, start the warmed local server:
+
+```bash
+.venv/bin/python omniparser_server.py --preset turbo --output-format jpg --host 127.0.0.1 --port 7862
+```
+
+Available endpoints:
+
+- `GET /healthz`
+- `POST /parse`
+- `POST /parse-path`
+
+Health check:
+
+```bash
+curl http://127.0.0.1:7862/healthz
+```
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "status": "ready",
+  "preset": "turbo"
+}
+```
+
+### Upload Endpoint
+
+Send an image file directly:
+
+```bash
+curl -X POST http://127.0.0.1:7862/parse \
+  -F "image=@/Users/you/Desktop/test.png" \
+  -F "output_format=jpg" \
+  -F "include_annotated_image=true"
+```
+
+Example response shape:
+
+```json
+{
+  "ok": true,
+  "input_image": "test.png",
+  "stats": {
+    "total_ms": 120.64,
+    "detect_ms": 74.85,
+    "caption_ms": 0.0,
+    "caption_cache_hits": 21,
+    "caption_cache_misses": 0
+  },
+  "label_coordinates": {
+    "0": [0.80, 0.25, 0.19, 0.10]
+  },
+  "parsed_content_list": [
+    {
+      "type": "icon",
+      "bbox": [0.80, 0.25, 0.99, 0.35],
+      "interactivity": true,
+      "content": "System"
+    }
+  ],
+  "annotated_image_mime_type": "image/jpeg",
+  "annotated_image_base64": "/9j/4AAQSk..."
+}
+```
+
+### File Path Endpoint
+
+If your app already wrote the screenshot to disk, send the local path instead:
+
+```bash
+curl -X POST http://127.0.0.1:7862/parse-path \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_path": "/Users/you/Desktop/test.png",
+    "output_dir": "/tmp/omni-out",
+    "output_format": "jpg",
+    "include_annotated_image": false
+  }'
+```
+
+Example response shape:
+
+```json
+{
+  "ok": true,
+  "input_image": "/Users/you/Desktop/test.png",
+  "stats": {
+    "total_ms": 464.14,
+    "detect_ms": 152.5,
+    "caption_ms": 262.19
+  },
+  "output_image": "/tmp/omni-out/test_annotated.jpg",
+  "output_json": "/tmp/omni-out/test_parsed.json",
+  "output_image_mime_type": "image/jpeg",
+  "items": 21
+}
+```
+
 ## Gradio App
 
 Start the local UI:
@@ -284,12 +389,88 @@ Recommended production path for Swift:
 
 That is the path that gets semantic responses to roughly `400-500ms` on the first request and roughly `100-120ms` on repeated identical screenshots.
 
+### Swift With The Server
+
+For a Swift macOS app, the server is often simpler than the worker protocol:
+
+1. launch `omniparser_server.py` once with `Process`
+2. keep it running on `127.0.0.1`
+3. send screenshots with `URLSession`
+4. decode JSON and either:
+   use `annotated_image_base64`, or
+   use `output_image` / `output_json` paths
+
+Example using the upload endpoint:
+
+```swift
+import Foundation
+
+struct OmniParserServerResponse: Decodable {
+    struct Stats: Decodable {
+        let total_ms: Double
+        let detect_ms: Double
+        let caption_ms: Double
+    }
+
+    struct Item: Decodable {
+        let type: String
+        let bbox: [Double]
+        let interactivity: Bool
+        let content: String?
+    }
+
+    let ok: Bool
+    let stats: Stats
+    let parsed_content_list: [Item]
+    let annotated_image_mime_type: String?
+    let annotated_image_base64: String?
+}
+
+func uploadScreenshot(_ imageData: Data) async throws -> OmniParserServerResponse {
+    let boundary = "Boundary-\(UUID().uuidString)"
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:7862/parse")!)
+    request.httpMethod = "POST"
+    request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+    var body = Data()
+    func append(_ string: String) {
+        body.append(string.data(using: .utf8)!)
+    }
+
+    append("--\(boundary)\r\n")
+    append("Content-Disposition: form-data; name=\"image\"; filename=\"screenshot.png\"\r\n")
+    append("Content-Type: image/png\r\n\r\n")
+    body.append(imageData)
+    append("\r\n")
+
+    append("--\(boundary)\r\n")
+    append("Content-Disposition: form-data; name=\"output_format\"\r\n\r\n")
+    append("jpg\r\n")
+
+    append("--\(boundary)\r\n")
+    append("Content-Disposition: form-data; name=\"include_annotated_image\"\r\n\r\n")
+    append("true\r\n")
+
+    append("--\(boundary)--\r\n")
+    request.httpBody = body
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        throw URLError(.badServerResponse)
+    }
+    return try JSONDecoder().decode(OmniParserServerResponse.self, from: data)
+}
+```
+
+If you prefer file paths instead of a large base64 response, call `POST /parse-path` with a temp screenshot path and an `output_dir`.
+
 ## Repository Layout
 
 Relevant files added or changed for the macOS workflow:
 
 - `omniparser_cli.py`
 - `omniparser_worker.py`
+- `omniparser_server.py`
 - `gradio_demo.py`
 - `requirements-parser.txt`
 - `util/omniparser.py`
