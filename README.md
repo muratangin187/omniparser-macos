@@ -3,9 +3,10 @@
 Mac-focused OmniParser setup with:
 
 - a verified single-image CLI
+- a persistent stdio worker for hot requests
 - a local Gradio app
 - Apple Silicon `mps` support
-- a faster `--fast` preset
+- subsecond balanced and ultra-fast presets
 - Swift-friendly JSON and annotated PNG outputs
 
 This repository is based on [microsoft/OmniParser](https://github.com/microsoft/OmniParser) and keeps the original project files, while adding the pieces needed to run it reliably on a modern Mac.
@@ -15,10 +16,12 @@ This repository is based on [microsoft/OmniParser](https://github.com/microsoft/
 Compared with upstream, this repo adds and fixes:
 
 - a real CLI entry point: `omniparser_cli.py`
+- a persistent worker process: `omniparser_worker.py`
 - a reusable parser wrapper in `util/omniparser.py`
 - lazy OCR backend loading so startup is more reliable on macOS
 - `mps` support for the Florence caption model path
-- a tuned `--fast` mode for Apple Silicon
+- tuned `balanced` and `ultra` presets for Apple Silicon
+- caption caching for repeated screenshots in a hot process
 - a Gradio launcher that does not assume CUDA or `share=True`
 - a smaller parser-only dependency file: `requirements-parser.txt`
 
@@ -70,7 +73,7 @@ Run the parser on a single screenshot:
 ```bash
 .venv/bin/python omniparser_cli.py \
   --image /absolute/path/to/screenshot.png \
-  --fast \
+  --preset balanced \
   --output-dir outputs
 ```
 
@@ -84,42 +87,102 @@ Example:
 ```bash
 .venv/bin/python omniparser_cli.py \
   --image /Users/you/Desktop/test.png \
-  --fast \
+  --preset balanced \
   --output-dir outputs
 ```
 
 Useful flags:
 
 - `--device auto|cpu|mps|cuda`
-- `--box-threshold 0.10`
-- `--imgsz 512`
-- `--batch-size 128`
-- `--ocr-batch-size 16`
-- `--ocr-canvas-size 1920`
+- `--som-device auto|cpu|mps|cuda`
+- `--preset full|balanced|ultra`
+- `--no-ocr`
+- `--no-semantics`
+- `--scale-img`
+- `--icon-crop-size 48`
+- `--max-new-tokens 6`
 - `--use-paddleocr`
 - `--fast`
 
-## Fast Mode
+## Performance Modes
 
-`--fast` is tuned for Apple Silicon and currently applies:
+`balanced` is the main Apple Silicon speed preset and currently applies:
 
 ```text
 --device mps
---box-threshold 0.10
+--som-device cpu
+--no-ocr
+--scale-img
+--box-threshold 0.15
 --imgsz 512
 --batch-size 128
---ocr-batch-size 16
---ocr-canvas-size 1920
+--icon-crop-size 48
+--max-new-tokens 6
 ```
 
-On the validation image used during setup on an Apple M4 Pro:
+`ultra` is the box-only preset:
+
+```text
+--device mps
+--som-device cpu
+--no-ocr
+--no-semantics
+--scale-img
+--box-threshold 0.20
+--imgsz 384
+```
+
+Measured on the validation image used during setup on an Apple M4 Pro:
 
 - older cold CPU path: about `18.85s`
 - older cold MPS path: about `23.62s`
-- current cold `--fast` path: about `11.23s`
-- best warm in-process benchmark: about `4.52s`
+- current cold CLI `balanced` wall time: about `5.79s`
+- current semantic parse time in `balanced`: about `954ms`
+- current hot-worker first `balanced` request wall time: about `1.03s`
+- current repeated cached `balanced` request wall time: about `295ms`
+- current hot-worker `ultra` request wall time: about `349ms`
 
-Those numbers will vary by screenshot size and GUI density, but the tuned path is materially faster than the original Mac run path.
+Those numbers will vary by screenshot size and GUI density, but the tuned hot-process path is materially faster than the original Mac run path.
+
+## Persistent Worker
+
+For a real app, do not spawn the CLI for every screenshot. Start the worker once and keep it alive:
+
+```bash
+.venv/bin/python omniparser_worker.py --preset balanced
+```
+
+The worker speaks JSON over stdin/stdout.
+
+Request:
+
+```json
+{"image_path":"/absolute/path/to/screenshot.png","output_dir":"/tmp/omni-out"}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "stats": {
+    "total_ms": 935.88,
+    "detect_ms": 141.5,
+    "caption_ms": 663.73,
+    "caption_cache_hits": 0,
+    "caption_cache_misses": 78
+  },
+  "output_image": "/tmp/omni-out/test_annotated.png",
+  "output_json": "/tmp/omni-out/test_parsed.json",
+  "items": 78
+}
+```
+
+Shutdown:
+
+```json
+{"action":"shutdown"}
+```
 
 ## Gradio App
 
@@ -128,7 +191,7 @@ Start the local UI:
 ```bash
 .venv/bin/python gradio_demo.py \
   --device mps \
-  --default-box-threshold 0.1 \
+  --default-box-threshold 0.15 \
   --default-imgsz 512 \
   --batch-size 128 \
   --ocr-batch-size 16 \
@@ -185,17 +248,25 @@ Typical command:
 /absolute/path/to/.venv/bin/python \
 /absolute/path/to/omniparser_cli.py \
 --image /absolute/path/to/screenshot.png \
---fast \
+--preset balanced \
 --output-dir /absolute/path/to/output-dir
 ```
 
-If your app processes many screenshots, spawning Python for every frame will become the bottleneck. In that case, the next step is to run a persistent local server or helper process that keeps the model loaded in memory.
+Recommended production path for Swift:
+
+1. start `omniparser_worker.py` once when the app launches
+2. keep stdin/stdout pipes open
+3. send one JSON request per screenshot
+4. reuse the in-memory model and caption cache
+
+That is the path that gets semantic responses to roughly `1s` on first request and a few hundred milliseconds on repeated similar screenshots.
 
 ## Repository Layout
 
 Relevant files added or changed for the macOS workflow:
 
 - `omniparser_cli.py`
+- `omniparser_worker.py`
 - `gradio_demo.py`
 - `requirements-parser.txt`
 - `util/omniparser.py`

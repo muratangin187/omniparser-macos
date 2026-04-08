@@ -22,6 +22,7 @@ import base64
 
 import os
 import ast
+import hashlib
 import torch
 from typing import Tuple, List, Union
 from torchvision.ops import box_convert
@@ -99,21 +100,49 @@ def get_yolo_model(model_path):
 
 
 @torch.inference_mode()
-def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=None, batch_size=128):
+def get_parsed_content_icon(
+    filtered_boxes,
+    starting_idx,
+    image_source,
+    caption_model_processor,
+    prompt=None,
+    batch_size=128,
+    icon_crop_size=64,
+    max_new_tokens=20,
+    caption_cache=None,
+    stats=None,
+):
     # Number of samples per batch, --> 128 roughly takes 4 GB of GPU memory for florence v2 model
     to_pil = ToPILImage()
     if starting_idx:
         non_ocr_boxes = filtered_boxes[starting_idx:]
     else:
         non_ocr_boxes = filtered_boxes
-    croped_pil_image = []
+    cropped_pil_image = []
+    cached_outputs = []
+    uncached_positions = []
+    uncached_keys = []
+    cache_hits = 0
+    cache_misses = 0
     for i, coord in enumerate(non_ocr_boxes):
         try:
             xmin, xmax = int(coord[0]*image_source.shape[1]), int(coord[2]*image_source.shape[1])
             ymin, ymax = int(coord[1]*image_source.shape[0]), int(coord[3]*image_source.shape[0])
             cropped_image = image_source[ymin:ymax, xmin:xmax, :]
-            cropped_image = cv2.resize(cropped_image, (64, 64))
-            croped_pil_image.append(to_pil(cropped_image))
+            cropped_image = cv2.resize(cropped_image, (icon_crop_size, icon_crop_size))
+            cache_key = None
+            if caption_cache is not None:
+                cache_key = hashlib.sha1(cropped_image.tobytes()).hexdigest()
+                cached_value = caption_cache.get(cache_key)
+                if cached_value is not None:
+                    cached_outputs.append(cached_value)
+                    cache_hits += 1
+                    continue
+            cropped_pil_image.append(to_pil(cropped_image))
+            uncached_positions.append(len(cached_outputs))
+            uncached_keys.append(cache_key)
+            cached_outputs.append(None)
+            cache_misses += 1
         except:
             continue
 
@@ -126,9 +155,10 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
     
     generated_texts = []
     device = model.device
-    for i in range(0, len(croped_pil_image), batch_size):
+    caption_started = time.time()
+    for i in range(0, len(cropped_pil_image), batch_size):
         start = time.time()
-        batch = croped_pil_image[i:i+batch_size]
+        batch = cropped_pil_image[i:i+batch_size]
         t1 = time.time()
         inputs = processor(images=batch, text=[prompt] * len(batch), return_tensors="pt", do_resize=False).to(device=device)
         if model.device.type in {"cuda", "mps"} and "pixel_values" in inputs:
@@ -137,7 +167,7 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
-                max_new_tokens=20,
+                max_new_tokens=max_new_tokens,
                 num_beams=1,
                 do_sample=False,
                 early_stopping=False,
@@ -148,8 +178,18 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
         generated_text = [gen.strip() for gen in generated_text]
         generated_texts.extend(generated_text)
-    
-    return generated_texts
+
+    for position, text, cache_key in zip(uncached_positions, generated_texts, uncached_keys):
+        cached_outputs[position] = text
+        if caption_cache is not None and cache_key is not None:
+            caption_cache[cache_key] = text
+
+    if stats is not None:
+        stats["caption_ms"] = round((time.time() - caption_started) * 1000, 2)
+        stats["caption_cache_hits"] = cache_hits
+        stats["caption_cache_misses"] = cache_misses
+
+    return cached_outputs
 
 
 
@@ -335,7 +375,7 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
                     else:
                         filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': None, 'source':'box_yolo_content_yolo'})
             else:
-                filtered_boxes.append(box1)
+                filtered_boxes.append(box1_elem)
     return filtered_boxes # torch.tensor(filtered_boxes)
 
 
@@ -405,7 +445,7 @@ def predict(model, image, caption, box_threshold, text_threshold):
     return boxes, logits, phrases
 
 
-def predict_yolo(model, image, box_threshold, imgsz, scale_img, iou_threshold=0.7):
+def predict_yolo(model, image, box_threshold, imgsz, scale_img, iou_threshold=0.7, device=None):
     """ Use huggingface model to replace the original model
     """
     # model = model['model']
@@ -415,12 +455,16 @@ def predict_yolo(model, image, box_threshold, imgsz, scale_img, iou_threshold=0.
         conf=box_threshold,
         imgsz=imgsz,
         iou=iou_threshold, # default 0.7
+        device=device,
+        verbose=False,
         )
     else:
         result = model.predict(
         source=image,
         conf=box_threshold,
         iou=iou_threshold, # default 0.7
+        device=device,
+        verbose=False,
         )
     boxes = result[0].boxes.xyxy#.tolist() # in pixel space
     conf = result[0].boxes.conf
@@ -434,7 +478,7 @@ def int_box_area(box, w, h):
     area = (int_box[2] - int_box[0]) * (int_box[3] - int_box[1])
     return area
 
-def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128):
+def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, icon_crop_size=64, max_new_tokens=20, caption_cache=None, stats=None, device=None):
     """Process either an image path or Image object
     
     Args:
@@ -448,6 +492,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     if not imgsz:
         imgsz = (h, w)
     # print('image size:', w, h)
+    detect_started = time.time()
     xyxy, logits, phrases = predict_yolo(
         model=model,
         image=image_source,
@@ -455,7 +500,10 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         imgsz=imgsz,
         scale_img=scale_img,
         iou_threshold=iou_threshold,
+        device=device,
     )
+    if stats is not None:
+        stats["detect_ms"] = round((time.time() - detect_started) * 1000, 2)
     xyxy = xyxy / torch.Tensor([w, h, w, h]).to(xyxy.device)
     image_source = np.asarray(image_source)
     phrases = [str(i) for i in range(len(phrases))]
@@ -465,7 +513,6 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         ocr_bbox = torch.tensor(ocr_bbox) / torch.Tensor([w, h, w, h])
         ocr_bbox=ocr_bbox.tolist()
     else:
-        print('no ocr bbox!!!')
         ocr_bbox = None
 
     ocr_bbox_elem = []
@@ -483,16 +530,27 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     # get the index of the first 'content': None
     starting_idx = next((i for i, box in enumerate(filtered_boxes_elem) if box['content'] is None), -1)
     filtered_boxes = torch.tensor([box['bbox'] for box in filtered_boxes_elem])
-    print('len(filtered_boxes):', len(filtered_boxes), starting_idx)
+    if stats is not None:
+        stats["boxes_after_filter"] = len(filtered_boxes)
 
     # get parsed icon local semantics
-    time1 = time.time()
     if use_local_semantics:
         caption_model = caption_model_processor['model']
         if 'phi3_v' in caption_model.config.model_type: 
             parsed_content_icon = get_parsed_content_icon_phi3v(filtered_boxes, ocr_bbox, image_source, caption_model_processor)
         else:
-            parsed_content_icon = get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=prompt,batch_size=batch_size)
+            parsed_content_icon = get_parsed_content_icon(
+                filtered_boxes,
+                starting_idx,
+                image_source,
+                caption_model_processor,
+                prompt=prompt,
+                batch_size=batch_size,
+                icon_crop_size=icon_crop_size,
+                max_new_tokens=max_new_tokens,
+                caption_cache=caption_cache,
+                stats=stats,
+            )
         ocr_text = [f"Text Box ID {i}: {txt}" for i, txt in enumerate(ocr_text)]
         icon_start = len(ocr_text)
         parsed_content_icon_ls = []
@@ -506,17 +564,23 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     else:
         ocr_text = [f"Text Box ID {i}: {txt}" for i, txt in enumerate(ocr_text)]
         parsed_content_merged = ocr_text
-    print('time to get parsed content:', time.time()-time1)
+        if stats is not None:
+            stats["caption_ms"] = 0.0
+            stats["caption_cache_hits"] = 0
+            stats["caption_cache_misses"] = 0
 
     filtered_boxes = box_convert(boxes=filtered_boxes, in_fmt="xyxy", out_fmt="cxcywh")
 
     phrases = [i for i in range(len(filtered_boxes))]
     
     # draw boxes
+    annotate_started = time.time()
     if draw_bbox_config:
         annotated_frame, label_coordinates = annotate(image_source=image_source, boxes=filtered_boxes, logits=logits, phrases=phrases, **draw_bbox_config)
     else:
         annotated_frame, label_coordinates = annotate(image_source=image_source, boxes=filtered_boxes, logits=logits, phrases=phrases, text_scale=text_scale, text_padding=text_padding)
+    if stats is not None:
+        stats["annotate_ms"] = round((time.time() - annotate_started) * 1000, 2)
     
     pil_img = Image.fromarray(annotated_frame)
     buffered = io.BytesIO()
